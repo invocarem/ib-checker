@@ -24,7 +24,7 @@ docker run --gpus all \
     --env "TORCH_DISTRIBUTED_TIMEOUT=1800" \
     --ipc=host \
     -it --rm \
-    scitrera/dgx-spark-sglang:0.5.9-t5 \
+    scitrera/dgx-spark-sglang:0.5.9-dev2-acab24a7-t5 \
     python3 -m sglang.launch_server \
         --model-path Qwen/Qwen3.5-35B-A3B \
         --served-model-name qwen3.5-35b \
