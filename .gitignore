@@ -1,0 +1,16 @@
+.env
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.nimis/
+.monitor/
+
+*.log
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
