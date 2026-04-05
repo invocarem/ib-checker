@@ -12,6 +12,10 @@ Usage (example: spark1 = server, spark2 = client):
   On spark2:
     python3 verify_dac_link.py client --peer 192.168.100.11 --local-bind 192.168.100.12 --port 45231
 
+  Single-stream TCP in Python is often only a few–10s Gb/s (CPU bound). For high links use parallel streams:
+    server: ... server --streams 16
+    client: ... client --streams 16 ...
+
 Optional link info (host shell, not inside minimal containers without ethtool):
     python3 verify_dac_link.py link-info --iface enp1s0f0np0
 
@@ -52,33 +56,57 @@ def _set_socket_opts(s: socket.socket) -> None:
             continue
 
 
-def run_server(listen_host: str, port: int, chunk: int) -> None:
+def _recv_until_eof(conn: socket.socket, chunk: int) -> int:
+    buf = bytearray(chunk)
+    total = 0
+    while True:
+        try:
+            n = conn.recv_into(buf)
+        except ConnectionResetError:
+            break
+        if n == 0:
+            break
+        total += n
+    return total
+
+
+def run_server(listen_host: str, port: int, chunk: int, streams: int) -> None:
+    total_lock = threading.Lock()
+    total_bytes = 0
+
+    def handle(conn: socket.socket, addr: tuple[str, int], idx: int) -> None:
+        nonlocal total_bytes
+        with conn:
+            _set_socket_opts(conn)
+            n = _recv_until_eof(conn, chunk)
+        with total_lock:
+            total_bytes += n
+        print(f"Stream {idx}/{streams} done from {addr[0]}:{addr[1]} ({n / 1e9:.3f} GB)", flush=True)
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as ls:
         ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         ls.bind((listen_host, port))
-        ls.listen(1)
-        print(f"Listening on {listen_host}:{port} (chunk={chunk} bytes)", flush=True)
-        conn, addr = ls.accept()
-    with conn:
-        _set_socket_opts(conn)
-        print(f"Accepted from {addr[0]}:{addr[1]}", flush=True)
-        total = 0
-        t0 = time.perf_counter()
-        buf = bytearray(chunk)
-        while True:
-            try:
-                n = conn.recv_into(buf)
-            except ConnectionResetError:
-                break
-            if n == 0:
-                break
-            total += n
-        elapsed = time.perf_counter() - t0
-        gbps = (total * 8) / elapsed / 1e9 if elapsed > 0 else 0.0
+        ls.listen(min(128, max(8, streams + 4)))
         print(
-            f"Received {total / 1e9:.4f} GB in {elapsed:.3f} s -> {gbps:.2f} Gb/s (receiver view)",
+            f"Listening on {listen_host}:{port} (chunk={chunk} bytes, streams={streams})",
             flush=True,
         )
+        t_wall0 = time.perf_counter()
+        workers: list[threading.Thread] = []
+        for i in range(streams):
+            conn, addr = ls.accept()
+            print(f"Accepted {i + 1}/{streams} from {addr[0]}:{addr[1]}", flush=True)
+            t = threading.Thread(target=handle, args=(conn, addr, i + 1), daemon=True)
+            workers.append(t)
+            t.start()
+        for t in workers:
+            t.join()
+        elapsed = time.perf_counter() - t_wall0
+    gbps = (total_bytes * 8) / elapsed / 1e9 if elapsed > 0 else 0.0
+    print(
+        f"Received {total_bytes / 1e9:.4f} GB total in {elapsed:.3f} s wall -> {gbps:.2f} Gb/s (receiver view)",
+        flush=True,
+    )
 
 
 def run_client(
@@ -87,26 +115,46 @@ def run_client(
     duration_s: float,
     chunk: int,
     local_bind: Optional[str],
+    streams: int,
 ) -> None:
     data = b"\0" * chunk
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if local_bind:
-            s.bind((local_bind, 0))
-            print(f"Bound local address {local_bind}", flush=True)
-        _set_socket_opts(s)
-        print(f"Connecting to {peer_host}:{port} ...", flush=True)
-        s.connect((peer_host, port))
-        print(f"Connected; sending for {duration_s} s ...", flush=True)
-        total = 0
-        t_end = time.perf_counter() + duration_s
-        t0 = time.perf_counter()
-        while time.perf_counter() < t_end:
-            s.sendall(data)
-            total += len(data)
-        elapsed = time.perf_counter() - t0
-    gbps = (total * 8) / elapsed / 1e9 if elapsed > 0 else 0.0
+    barrier = threading.Barrier(streams)
+    total_lock = threading.Lock()
+    total_bytes = 0
+
+    def worker(stream_id: int) -> None:
+        nonlocal total_bytes
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if local_bind:
+                s.bind((local_bind, 0))
+            _set_socket_opts(s)
+            s.connect((peer_host, port))
+            barrier.wait()
+            t0 = time.perf_counter()
+            local = 0
+            while time.perf_counter() < t0 + duration_s:
+                s.sendall(data)
+                local += len(data)
+        with total_lock:
+            total_bytes += local
+        print(f"Stream {stream_id}/{streams} sent {local / 1e9:.4f} GB", flush=True)
+
+    if local_bind:
+        print(f"Bound local address {local_bind}", flush=True)
     print(
-        f"Sent {total / 1e9:.4f} GB in {elapsed:.3f} s -> {gbps:.2f} Gb/s (sender view)",
+        f"Connecting {streams} TCP streams to {peer_host}:{port} ...",
+        flush=True,
+    )
+    threads = [
+        threading.Thread(target=worker, args=(i + 1,), daemon=True) for i in range(streams)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    gbps = (total_bytes * 8) / duration_s / 1e9 if duration_s > 0 else 0.0
+    print(
+        f"Sent {total_bytes / 1e9:.4f} GB aggregate in {duration_s:.3f} s window -> {gbps:.2f} Gb/s (sender view)",
         flush=True,
     )
 
@@ -231,12 +279,26 @@ def main() -> None:
     ps.add_argument("--listen", default="0.0.0.0", help="Address to bind (use your 192.168.100.x IP)")
     ps.add_argument("--port", type=int, default=45231)
     ps.add_argument("--chunk", type=int, default=DEFAULT_CHUNK, help="Bytes per recv()")
+    ps.add_argument(
+        "--streams",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of parallel TCP connections to accept (must match client)",
+    )
 
     pc = sub.add_parser("client", help="Send to server for fixed duration")
     pc.add_argument("--peer", required=True, help="Remote 192.168.100.x address")
     pc.add_argument("--port", type=int, default=45231)
     pc.add_argument("--duration", type=float, default=10.0, help="Seconds to send")
     pc.add_argument("--chunk", type=int, default=DEFAULT_CHUNK, help="Bytes per send()")
+    pc.add_argument(
+        "--streams",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Parallel TCP connections (reduces single-thread CPU bottleneck on fast links)",
+    )
     pc.add_argument(
         "--local-bind",
         default=None,
@@ -263,9 +325,16 @@ def main() -> None:
     args = p.parse_args()
 
     if args.cmd == "server":
-        run_server(args.listen, args.port, args.chunk)
+        run_server(args.listen, args.port, args.chunk, args.streams)
     elif args.cmd == "client":
-        run_client(args.peer, args.port, args.duration, args.chunk, args.local_bind)
+        run_client(
+            args.peer,
+            args.port,
+            args.duration,
+            args.chunk,
+            args.local_bind,
+            args.streams,
+        )
     elif args.cmd == "bidir":
         if not args.local_bind:
             print("bidir requires --local-bind <this host 192.168.100.x>", file=sys.stderr)
